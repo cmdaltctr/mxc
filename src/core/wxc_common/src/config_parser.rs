@@ -300,6 +300,81 @@ fn validate_paths(paths: &[String], logger: &mut Logger) -> Result<(), WxcError>
     Ok(())
 }
 
+/// Normalizes cross-list filesystem path constraints by applying
+/// **most-restrictive-wins** precedence (`deny` > `readonly` > `readwrite`):
+///
+/// 1. Same-path conflict: if a path string appears in multiple lists, it is kept
+///    only in the most restrictive list (e.g. a path in both `readwritePaths` and
+///    `deniedPaths` is normalized to denied).
+/// 2. Paths should exist: logs a WARNING for paths that don't exist on the host
+///    (advisory — some backends create mount targets dynamically; not a hard error).
+///
+/// This never rejects the config — conflicting intents are resolved deterministically
+/// rather than erroring, matching the roadmap's most-restrictive-wins decision.
+fn normalize_filesystem_paths(policy: &mut ContainerPolicy, logger: &mut Logger) {
+    if policy.readwrite_paths.is_empty()
+        && policy.readonly_paths.is_empty()
+        && policy.denied_paths.is_empty()
+    {
+        return;
+    }
+
+    // 1. Same-path (string) conflict: drop a path from a list if it also appears
+    //    in a more restrictive list.
+    let denied: std::collections::HashSet<String> = policy.denied_paths.iter().cloned().collect();
+    let readonly: std::collections::HashSet<String> =
+        policy.readonly_paths.iter().cloned().collect();
+
+    policy.readwrite_paths.retain(|p| {
+        if denied.contains(p) {
+            logger.log_line(&format!(
+                "Filesystem path '{}' appears in 'readwritePaths' and 'deniedPaths'; \
+                 applying most-restrictive intent (denied)",
+                p
+            ));
+            false
+        } else if readonly.contains(p) {
+            logger.log_line(&format!(
+                "Filesystem path '{}' appears in 'readwritePaths' and 'readonlyPaths'; \
+                 applying most-restrictive intent (readonly)",
+                p
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    policy.readonly_paths.retain(|p| {
+        if denied.contains(p) {
+            logger.log_line(&format!(
+                "Filesystem path '{}' appears in 'readonlyPaths' and 'deniedPaths'; \
+                 applying most-restrictive intent (denied)",
+                p
+            ));
+            false
+        } else {
+            true
+        }
+    });
+
+    // 2. Existence warning (advisory; not a hard gate).
+    for (paths, list_name) in [
+        (&policy.readwrite_paths, "readwritePaths"),
+        (&policy.readonly_paths, "readonlyPaths"),
+        (&policy.denied_paths, "deniedPaths"),
+    ] {
+        for path in paths {
+            if fs::metadata(path).is_err() {
+                logger.log_line(&format!(
+                    "WARNING: filesystem path '{}' (in '{}') does not exist on the host; \
+                     the backend may fail at mount time",
+                    path, list_name
+                ));
+            }
+        }
+    }
+}
+
 // ---------- Conversion from wire model to domain model ----------
 
 /// Convert a typed `wire::Proxy` block into the validated domain `ProxyConfig`.
@@ -687,6 +762,7 @@ fn convert_wire_config(
         }
     }
     validate_filesystem_paths(&policy, logger)?;
+    normalize_filesystem_paths(&mut policy, logger);
 
     // Fallback section
     if let Some(fbcfg) = cfg.fallback {
@@ -3718,5 +3794,83 @@ mod tests {
         let encoded = base64_encode(json.as_bytes());
         let mut logger = test_logger();
         load_request(&encoded, &mut logger, true).expect_err("vm has no resolver off Windows");
+    }
+
+    // --- Filesystem policy normalization tests (most-restrictive-wins) ---
+
+    #[test]
+    fn same_path_in_readwrite_and_denied_becomes_denied() {
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "process", "filesystem": {"readwritePaths": ["C:\\workspace"], "deniedPaths": ["C:\\workspace"]}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy.readwrite_paths.is_empty(),
+            "path should be removed from readwritePaths (denied wins)"
+        );
+        assert_eq!(req.policy.denied_paths, vec!["C:\\workspace"]);
+    }
+
+    #[test]
+    fn same_path_in_readwrite_and_readonly_becomes_readonly() {
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "process", "filesystem": {"readwritePaths": ["C:\\workspace"], "readonlyPaths": ["C:\\workspace"]}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy.readwrite_paths.is_empty(),
+            "path should be removed from readwritePaths (readonly wins)"
+        );
+        assert_eq!(req.policy.readonly_paths, vec!["C:\\workspace"]);
+    }
+
+    #[test]
+    fn same_path_in_readonly_and_denied_becomes_denied() {
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "process", "filesystem": {"readonlyPaths": ["C:\\tools"], "deniedPaths": ["C:\\tools"]}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(
+            req.policy.readonly_paths.is_empty(),
+            "path should be removed from readonlyPaths (denied wins)"
+        );
+        assert_eq!(req.policy.denied_paths, vec!["C:\\tools"]);
+    }
+
+    #[test]
+    fn same_path_in_all_three_lists_becomes_denied() {
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "process", "filesystem": {"readwritePaths": ["C:\\x"], "readonlyPaths": ["C:\\x"], "deniedPaths": ["C:\\x"]}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert!(req.policy.readwrite_paths.is_empty());
+        assert!(req.policy.readonly_paths.is_empty());
+        assert_eq!(req.policy.denied_paths, vec!["C:\\x"]);
+    }
+
+    #[test]
+    fn distinct_paths_across_lists_preserved() {
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "process", "filesystem": {"readwritePaths": ["C:\\workspace"], "readonlyPaths": ["C:\\tools"], "deniedPaths": ["C:\\secrets"]}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        // Distinct paths — nothing dropped.
+        let req = load_request(&encoded, &mut logger, true).unwrap();
+        assert_eq!(req.policy.readwrite_paths, vec!["C:\\workspace"]);
+        assert_eq!(req.policy.readonly_paths, vec!["C:\\tools"]);
+        assert_eq!(req.policy.denied_paths, vec!["C:\\secrets"]);
+    }
+
+    #[test]
+    fn empty_filesystem_lists_accepted() {
+        let json = r#"{"process": {"commandLine": "echo hi"}, "containment": "process", "filesystem": {"readwritePaths": [], "readonlyPaths": [], "deniedPaths": []}}"#;
+        let encoded = base64_encode(json.as_bytes());
+        let mut logger = test_logger();
+
+        load_request(&encoded, &mut logger, true).unwrap();
     }
 }
