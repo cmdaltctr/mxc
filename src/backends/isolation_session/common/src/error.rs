@@ -328,10 +328,24 @@ pub(super) fn activation_error(code: u32, detail: &str) -> IsolationSessionError
 /// names no operation and carries no status.
 pub(super) fn sta_refusal() -> IsolationSessionError {
     IsolationSessionError::Lifecycle(LifecycleFailure::Refused {
-        message: "this thread is in a single-threaded apartment, where the lifecycle deadlocks"
+        message: "this thread is in a single-threaded apartment, which this backend refuses"
             .to_string(),
         remediation: "Call from a multi-threaded apartment; a UI application must marshal this \
                       onto a background thread."
+            .to_string(),
+    })
+}
+
+/// The refusal for a caller whose impersonation token cannot be carried onto
+/// the thread that makes the call.
+pub(super) fn identity_refusal(err: windows_core::Error) -> IsolationSessionError {
+    IsolationSessionError::Lifecycle(LifecycleFailure::Refused {
+        message: format!(
+            "the calling thread's impersonation token could not be carried onto the thread that \
+             makes the call: {err}"
+        ),
+        remediation: "Call without impersonating, or with an impersonation token this process can \
+                      duplicate at SecurityImpersonation level."
             .to_string(),
     })
 }

@@ -47,10 +47,11 @@ Requirements on an in-process caller:
   *"requires an interactive session"* (`0x80040233`), so a caller running as a
   service, or over a remote SYSTEM-context shell, cannot complete the lifecycle.
   `provision` succeeds first and mints an OS account that must be deprovisioned.
-- **A caller in a single-threaded apartment is refused.** Any other caller enters
-  a multi-threaded apartment held for the manager's lifetime and balanced on
-  drop. A UI application must marshal onto a background thread.
+- **A caller in a single-threaded apartment is refused.** A UI application must
+  marshal onto a background thread.
   `mxc-sdk/examples/sta_probe.rs` measures this against a live host.
+- **An impersonating caller is refused unless this process can duplicate its
+  token at `SecurityImpersonation` level.**
 
 The **one-shot** surface is served in-process with piped stdio:
 `mxc_sdk::run` and `spawn_sandbox`, without a runtime experimental opt-in.
@@ -440,6 +441,7 @@ is the API's own message, passed through verbatim.
 | Activation failure (`backend_unavailable`) | ✅ | ✅ | — |
 | The API's status code itself could not be read | ✅ | — | best-effort |
 | Single-threaded-apartment refusal | — | — | ✅ |
+| Impersonation-token refusal | — | — | ✅ |
 | MXC-internal failure (relay threads, console handles) | — | — | — |
 | `Policy` and the MXC-side `malformed_*` rejections | — | — | — |
 
