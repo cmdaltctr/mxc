@@ -29,7 +29,7 @@ the individual local test scripts are documented in
 | `.github/workflows/Validation.Tests.Matrix.Job.yml` | `workflow_call`-only. Resolves the plan and runs the per-family test jobs. |
 | `scripts/ci/validation-test-matrix.json` | The matrix: OS versions, backends, triggers, job staggering. |
 | `scripts/ci/resolve-validation-test-matrix.mjs` | Matrix validator + plan expander. Emits the GitHub Actions matrices. |
-| `scripts/ci/prepare-windows-host.ps1` | Per-backend Windows host preparation / prerequisite assertions, plus the `winget` repair and the packaged-tooling install. |
+| `scripts/ci/prepare-windows-host.ps1` | Per-backend Windows host preparation / prerequisite assertions, plus the `winget` repair and the workload-tooling install. Runs in Windows PowerShell, because it installs the `pwsh` the steps after it use. |
 | `scripts/ci/prepare-linux-host.sh` | Per-backend Linux package install and service startup (distro-aware), plus the workload-interpreter inventory. |
 | `scripts/ci/prepare-macos-host.sh` | Per-backend macOS host preparation / prerequisite assertions. |
 | `scripts/ci/run_backend_validation_tests.ps1` | Windows dispatcher: backend id → existing backend suite. Also points `TEMP` at `$RUNNER_TEMP` so logs get collected. |
@@ -87,7 +87,7 @@ uploaded either way — see [Log collection](#log-collection).
 ### `platforms`
 
 Declares an OS image and, per architecture, the build it consumes, the host pool
-it runs on, and **which backends that platform is capable of running**. This is
+it runs on, and **which backends that platform is capable of running in CI**. This is
 a capability declaration, not a schedule.
 
 | Field | Meaning |
@@ -104,24 +104,22 @@ a capability declaration, not a schedule.
 
 Current platforms:
 
-| Platform id | Family | x64 pool | arm64 pool | Declared backends (x64) |
-|-------------|--------|----------|------------|--------------------------|
-| `windows-prerelease-process-container` | windows | `1es-mxc-windows-prerelease-t1-x64` | *(dormant)* | process-t1, process-t3, isolation-session, wslc, windows-sandbox, microvm, hyperlight |
-| `windows-prerelease-isolation-session` | windows | *(dormant)* | *(dormant)* | same as above |
-| `windows-canary` | windows | *(dormant)* | *(dormant)* | process-t1, process-t3, wslc, windows-sandbox, microvm, hyperlight |
-| `windows-25h2` | windows | `1es-mxc-e2e-windows-25h2-pro-x64` | *(dormant)* | same as above |
-| `windows-24h2` | windows | `1es-mxc-e2e-windows-24h2-pro-x64` | *(dormant)* | same as above |
-| `windows-23h2` | windows | `1es-mxc-e2e-windows-23h2-enterprise-x64` | *(dormant)* | process-t3, wslc, windows-sandbox, microvm, hyperlight |
-| `ubuntu-26.04` | linux | `1es-mxc-e2e-ubuntu-26.04-x64` | *(dormant)* | bubblewrap, hyperlight, lxc |
-| `ubuntu-24.04` | linux | `1es-mxc-e2e-ubuntu-24.04-x64` | *(dormant)* | bubblewrap, microvm, hyperlight, lxc |
-| `rhel-10` | linux | `1es-mxc-e2e-rhel-10-x64` | *(dormant)* | bubblewrap, hyperlight, lxc |
-| `debian-13` | linux | `1es-mxc-e2e-debian-13-x64` | *(dormant)* | bubblewrap, hyperlight, lxc |
-| `macos-26` | macos | — | runner `macos-26` | seatbelt |
-| `macos-15` | macos | — | runner `macos-15` | seatbelt |
+| Platform id | Family | x64 pool | arm64 pool | Declared backends (x64) | Declared backends (arm64) |
+|-------------|--------|----------|------------|--------------------------|------------|
+| `windows-prerelease-process-container` | windows | `1es-mxc-windows-prerelease-t1-x64` | `1es-mxc-windows-prerelease-t1-arm64` | process-t1, isolation-session, wslc, windows-sandbox, microvm | process-t1, isolation-session |
+| `windows-prerelease-isolation-session` | windows | `1es-mxc-e2e-win-prerelease-isolationsesh-x64` | `1es-mxc-e2e-win-prerelease-isolationsesh-arm64` | same as above | same as above |
+| `windows-25h2` | windows | `1es-mxc-e2e-windows-25h2-pro-x64` | `1es-mxc-e2e-windows-25h2-pro-arm64` | process-t1, wslc, windows-sandbox, microvm | process-t1, isolation-session |
+| `windows-24h2` | windows | `1es-mxc-e2e-windows-24h2-pro-x64` | `1es-mxc-e2e-windows-24h2-pro-arm64` | process-t1, wslc, windows-sandbox, microvm | process-t1, isolation-session |
+| `windows-23h2` | windows | `1es-mxc-e2e-windows-23h2-enterprise-x64` | *(dormant)* | process-t3, wslc, windows-sandbox, microvm | — |
+| `ubuntu-26.04` | linux | `1es-mxc-e2e-ubuntu-26.04-x64` | *(dormant)* | bubblewrap, lxc | — |
+| `ubuntu-24.04` | linux | `1es-mxc-e2e-ubuntu-24.04-x64` | *(dormant)* | bubblewrap, microvm, lxc | — |
+| `rhel-10` | linux | `1es-mxc-e2e-rhel-10-x64` | *(dormant)* | bubblewrap, lxc | — |
+| `debian-13` | linux | `1es-mxc-e2e-debian-13-x64` | *(dormant)* | bubblewrap, lxc | — |
+| `macos-26` | macos | — | runner `macos-26` | — | seatbelt |
+| `macos-15` | macos | — | runner `macos-15` | — | seatbelt |
 
-ARM64 is declared throughout but never emitted: no Azure VM SKU offers nested
-virtualization on ARM CPUs yet, so the resolver filters Windows/Linux ARM64 out
-after expansion (`suppressNonMacArm64`). macOS is ARM64-only.
+ARM64 is declared throughout but dormant wherever CI cannot run it: no Azure VM SKU offers nested
+virtualization on ARM CPUs yet, so only backends that don't require virtualization are supported. macOS is ARM64-only.
 
 ### Backend ids
 
@@ -188,11 +186,6 @@ backend **and** has a non-empty pool.
 | `pr` | *(nothing — `Build.yml` does not call the matrix job)* | empty; reserved for a potential future PR-time subset |
 | `enabled` | *(nothing — resolvable locally only)* | reserved for testing this infrastructure and rapid iteration |
 
-Resolved `nightly` today = **19 jobs**: 9 Windows (prerelease/25H2/24H2 × process-t1 + wslc;
-prerelease × isolation-session; 23H2 × process-t3 + wslc),
-8 Linux (each of the four distros × bubblewrap + lxc) and 2 macOS
-(macOS 26 and macOS 15 × seatbelt).
-
 ### `backendDelayedStart`
 
 Optional. This section staggers the start of jobs
@@ -230,7 +223,6 @@ get fixed or wired.
 | IsolationSession | ✅ Good | Runs the one-shot suite plus state aware tests (provision/start/exec/stop/deprovision lifecycle). |
 | Windows Sandbox | ⛔ Blocked | Images don't support `Containers-DisposableClientVM` opt. feature |
 | MicroVM | ⛔ Not working | Windows cold and warm starts hang; no Linux suite. The artifact payload is currently commented out in the build jobs. |
-| Hyperlight | ⛔ Not implemented | No suite on any platform. |
 | Seatbelt | ✅ Good | Failures are genuine MXC bugs. |
 
 ## Host preparation
@@ -261,8 +253,8 @@ message instead of surfacing later as an opaque backend error.
 
 The script does provision two things, for every backend rather than a particular
 one: `Repair-Winget` re-registers the App Installer package when `winget` is on
-`PATH` but cannot run, and `Install-PackagedTooling` then installs `winapp` and
-`openssl`
+`PATH` but cannot run, and `Install-WorkloadTooling` then installs `pwsh`,
+`node`, `python`, `winapp`, and `openssl`
 ([below](#who-installs-what)).
 
 Every run also opens with the host's Windows caption, release, build, and
@@ -280,7 +272,6 @@ a process-container job selects follows from that build.
   is in place. On RHEL-likes it needs EPEL first, because Red Hat dropped LXC
   after RHEL 7 and ships no replacement.
 - `microvm` — asserts the NanVix payload exists.
-- `hyperlight` — no-op.
 
 Every install above goes through two shared helpers rather than its own
 package-manager chain: `resolve_package_manager` picks the first of `apt-get`,
@@ -311,10 +302,10 @@ mid-suite failure.
 
 | Interpreter | Platforms | Version | Notes |
 |-------------|-----------|---------|-------|
-| `pwsh` | all | Latest 7.x | The only entry whose absence fails a job, and only on Windows. |
+| `pwsh` | all | Latest | Installed per job on Windows — see below. The only entry whose absence fails a job, and only on Windows. |
 | `git` | all | Latest | |
-| `node`, `npm`, `npx` | all | 24.x | `npm` and `npx` arrive with Node. |
-| `python`, `pip` | all | Latest | Windows tries `python` first, Unix `python3`. |
+| `node`, `npm`, `npx` | all | Latest LTS | `npm` and `npx` arrive with Node. Installed per job on Windows. |
+| `python`, `pip` | all | Latest stable | Windows tries `python` first, Unix `python3`. Installed per job on Windows. |
 | `dotnet` | all | Latest LTS | Currently 10.x, from the `LTS` channel — resolved at image-build time, not pinned. |
 | `az` | all | Latest | No ARM64 Windows build exists; ARM64 images get the x64 one under emulation. |
 | `gh` | all | Latest | |
@@ -325,9 +316,10 @@ mid-suite failure.
 | `scoop`, `choco` | Windows | Latest | |
 | `brew` | macOS | Latest | |
 
-Nothing is pinned: every entry is whatever was current when the image was built,
-within the constraint in the Version column. Only Node is held to a major
-version, because the SDK targets it.
+Nothing is pinned to an exact version: an image-provided entry is whatever was
+current when the image was built, and a per-job install is whatever the source
+offers that day — the LTS line for Node, and for Python the newest stable minor,
+since Python publishes no LTS line of its own.
 
 The list is **suite-agnostic by design** and is checked for every backend, not
 only the ones whose suites need it today: it describes what a validation *host*
@@ -361,13 +353,12 @@ Every pool runs images pre-provisioned with programs installed by
 `ubuntu-debian-provision.sh` / `rhel-provision.sh` for Linux and 
 `windows-provision.ps1` for Windows. These scripts are located in the
 `validation-provision-artifacts` branch in the ADO repo. On Windows that
-script covers `dotnet`, `choco`, `scoop`, `az`, `gh` and `nuget`; the remaining
-runtimes (`node`, `python`, `pwsh`, `git`) come from separate image artifacts.
+script covers `dotnet`, `choco`, `scoop`, `az`, `gh` and `nuget`; `git` comes
+from a separate image artifact.
 
-During the start of a job, the installed programs are inventoried; no job
-installs a workload interpreter. Windows is the one exception, installing
-OpenSSL and WinApp via the repaired WinGet, because both are published as
-packaged applications.
+During the start of a job, the installed programs are inventoried. On Linux and
+macOS no job installs a workload interpreter. Windows installs five of them
+through the repaired winget - `pwsh`, `node`, `python`, `openssl`, and `winapp`.
 
 A backend's own prerequisites are separate and are still installed per job by
 `prepare-linux-host.sh` — see [Host preparation](#host-preparation).
@@ -495,9 +486,10 @@ cron *and* a job condition *and* a dispatch choice.
 
 ### Enable ARM64
 
-Set the ARM64 `pool` for the platform *and* remove or narrow
-`suppressNonMacArm64` in the resolver. Note that the resolver rejects
-`hyperlight` and `microvm` on ARM64 outright (x64-only runtimes), and the WSLC
+Set the ARM64 `pool` for the platform. That is the whole switch: an
+architecture with an empty pool is skipped during expansion, so filling one in
+is what puts its jobs in the matrix. Note that the resolver rejects
+`microvm` on ARM64 outright (x64-only runtimes), and the WSLC
 dispatcher still refuses non-x64.
 
 ## Testing Your Changes to the Validation Infrastructure
