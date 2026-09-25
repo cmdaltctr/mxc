@@ -42,15 +42,22 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use wslc_common::container_steps::OutStream;
 use wslc_common::daemon_protocol::{
-    encode_frame, DaemonRequest, DaemonResponse, StreamFrame, MAX_FRAME_SIZE,
+    encode_frame, DaemonRequest, DaemonResponse, ExecTerminal, StreamFrame, MAX_FRAME_SIZE,
 };
 
 use crate::session_manager::{ExecStream, SessionHandle, WorkerError};
 
-/// Upper bound on concurrently-serviced client connections. At capacity the
-/// accept loop applies backpressure (a new connection waits for a slot) instead
-/// of spawning an unbounded number of handler tasks.
-const MAX_CONCURRENT_CLIENTS: usize = 128;
+/// The WSLc SDK worker is apartment-affine and executes one command at a time.
+/// Refuse additional execs instead of admitting a queue that cannot run.
+const MAX_CONCURRENT_EXECS: usize = 1;
+
+/// Capacity reserved for cancellation and lifecycle requests while all exec
+/// stream slots are occupied.
+const CONTROL_CLIENT_RESERVE: usize = 8;
+
+/// Upper bound on concurrently-serviced client connections. Connections beyond
+/// this bound are refused without blocking the accept loop.
+const MAX_CONCURRENT_CLIENTS: usize = MAX_CONCURRENT_EXECS + CONTROL_CLIENT_RESERVE;
 
 /// Deadline for a freshly-connected client to send its first (request) frame. A
 /// client that connects and then stalls must not pin a handler task — and a
@@ -103,7 +110,8 @@ pub async fn run(
         draining,
     } = signals;
     let mut server = first_instance;
-    let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
+    let client_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
+    let exec_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_EXECS));
     let mut clients: JoinSet<()> = JoinSet::new();
 
     // A create-instance failure that persists past its retry budget is fatal:
@@ -155,12 +163,12 @@ pub async fn run(
                 // does not abandon a connection we already accepted.
                 spawn_client_handler(
                     &mut clients,
-                    &limiter,
+                    &client_limiter,
+                    &exec_limiter,
                     &session,
                     &active_clients,
                     connected,
-                )
-                .await;
+                );
 
                 match next {
                     Ok(n) => server = n,
@@ -194,29 +202,28 @@ pub async fn run(
     }
 }
 
-/// Acquire a concurrency slot (backpressure at capacity) and spawn a task to
-/// service one accepted client connection, tracking it in `active_clients` for
-/// the idle watchdog.
-async fn spawn_client_handler(
+/// Spawn a bounded task to service one accepted client connection.
+fn spawn_client_handler(
     clients: &mut JoinSet<()>,
-    limiter: &Arc<Semaphore>,
+    client_limiter: &Arc<Semaphore>,
+    exec_limiter: &Arc<Semaphore>,
     session: &SessionHandle,
     active_clients: &Arc<AtomicUsize>,
     connected: NamedPipeServer,
 ) {
-    // Bound concurrency: acquire a slot before spawning. At capacity this awaits
-    // a free slot (backpressure) rather than spawning an unbounded task. The
-    // semaphore is never closed, so acquire cannot fail.
-    let permit = Semaphore::acquire_owned(limiter.clone())
-        .await
-        .expect("client semaphore is never closed");
+    let Ok(permit) = client_limiter.clone().try_acquire_owned() else {
+        // The connection is already accepted, so dropping it is the only
+        // bounded refusal path that cannot stall the accept loop.
+        return;
+    };
 
     let session = session.clone();
+    let exec_limiter = Arc::clone(exec_limiter);
     let active = active_clients.clone();
     active.fetch_add(1, Ordering::SeqCst);
     clients.spawn(async move {
         let _permit = permit;
-        if let Err(e) = handle_client(connected, session).await {
+        if let Err(e) = handle_client(connected, session, exec_limiter).await {
             eprintln!("[wslc-daemon] client connection error: {e:#}");
         }
         active.fetch_sub(1, Ordering::SeqCst);
@@ -372,7 +379,14 @@ fn current_user_sid_string() -> Result<String> {
 }
 
 /// Service exactly one request on a freshly-connected pipe instance.
-async fn handle_client(mut pipe: NamedPipeServer, session: SessionHandle) -> Result<()> {
+async fn handle_client<S>(
+    mut pipe: S,
+    session: SessionHandle,
+    exec_limiter: Arc<Semaphore>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Bound the wait for the request frame so a client that connects and then
     // stalls cannot pin this handler (and its concurrency slot) indefinitely.
     let request: DaemonRequest = timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut pipe))
@@ -402,7 +416,22 @@ async fn handle_client(mut pipe: NamedPipeServer, session: SessionHandle) -> Res
             write_frame(&mut pipe, &resp).await?;
         }
         DaemonRequest::Exec(config) => {
-            handle_exec(pipe, session, config).await?;
+            let Ok(exec_permit) = exec_limiter.try_acquire_owned() else {
+                write_frame(
+                    &mut pipe,
+                    &DaemonResponse::Err {
+                        kind: wslc_common::daemon_protocol::ErrKind::Busy,
+                        message: "WSLc daemon exec capacity is exhausted".to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            };
+            handle_exec(pipe, session, config, exec_permit).await?;
+        }
+        DaemonRequest::CancelExec(config) => {
+            session.cancel_exec(&config.exec_id, &config.run_token);
+            write_frame(&mut pipe, &DaemonResponse::Ok).await?;
         }
     }
     Ok(())
@@ -426,11 +455,15 @@ async fn handle_client(mut pipe: NamedPipeServer, session: SessionHandle) -> Res
 /// unavailable. Piped stdin would require a handle-mode rearchitecture (no
 /// callbacks; `ReadFile` threads for stdout/stderr + `WriteFile` for stdin) and
 /// is deferred; stdin forwarding is tracked in issue #804.
-async fn handle_exec(
-    mut pipe: NamedPipeServer,
+async fn handle_exec<S>(
+    mut pipe: S,
     session: SessionHandle,
     config: wslc_common::daemon_protocol::ExecConfig,
-) -> Result<()> {
+    _exec_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     // Await the worker's admission decision before writing anything: a rejected
     // exec is a pre-admission typed error, never a post-admission stream frame.
     write_exec_result(&mut pipe, session.exec(config).await).await
@@ -450,6 +483,7 @@ async fn write_exec_result<S: AsyncWrite + Unpin>(
         done,
         mut output,
         overflowed,
+        registration: _registration,
     } = match admission {
         Ok(stream) => stream,
         Err(e) => {
@@ -515,7 +549,7 @@ fn output_frame((kind, data): (OutStream, Vec<u8>)) -> StreamFrame {
 /// (already an `Error`) is strictly more informative and passes through
 /// unchanged.
 fn terminal_frame(
-    result: Result<Result<i32, WorkerError>, oneshot::error::RecvError>,
+    result: Result<Result<ExecTerminal, WorkerError>, oneshot::error::RecvError>,
     overflowed: &AtomicBool,
 ) -> StreamFrame {
     match exit_terminal(result) {
@@ -531,10 +565,12 @@ fn terminal_frame(
 /// Map a completed exec's result (or a dropped completion channel) to its
 /// terminal [`StreamFrame`].
 fn exit_terminal(
-    result: Result<Result<i32, WorkerError>, oneshot::error::RecvError>,
+    result: Result<Result<ExecTerminal, WorkerError>, oneshot::error::RecvError>,
 ) -> StreamFrame {
     match result {
-        Ok(Ok(code)) => StreamFrame::Exit { code },
+        Ok(Ok(ExecTerminal::Exited(code))) => StreamFrame::Exit { code },
+        Ok(Ok(ExecTerminal::TimedOut)) => StreamFrame::TimedOut,
+        Ok(Ok(ExecTerminal::Cancelled)) => StreamFrame::Cancelled,
         Ok(Err(e)) => StreamFrame::Error {
             message: e.to_string(),
         },
@@ -584,14 +620,81 @@ async fn write_frame<S: AsyncWrite + Unpin, T: Serialize>(pipe: &mut S, msg: &T)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_manager::{register_exec, spawn};
     use tokio::io::duplex;
     use tokio::sync::mpsc;
-    use wslc_common::daemon_protocol::ErrKind;
+    use wslc_common::daemon_protocol::{CancelExecConfig, ErrKind, ExecConfig};
+
+    fn test_registration() -> Arc<crate::session_manager::ExecRegistration> {
+        let active_execs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        Arc::new(register_exec(&active_execs, "test-exec", "test-run", &cancellation).unwrap())
+    }
+
+    #[tokio::test]
+    async fn exhausted_exec_capacity_returns_busy() {
+        let session = spawn().unwrap();
+        let exec_limiter = Arc::new(Semaphore::new(1));
+        let _permit = exec_limiter.clone().acquire_owned().await.unwrap();
+        let (mut client, server) = duplex(64 * 1024);
+        write_frame(
+            &mut client,
+            &DaemonRequest::Exec(ExecConfig {
+                exec_id: "exec-busy".to_string(),
+                run_token: "run-busy".to_string(),
+                sandbox_id: "wslc:test".to_string(),
+                script_code: "echo hi".to_string(),
+                working_directory: String::new(),
+                env: Vec::new(),
+                timeout_ms: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_client(server, session.clone(), exec_limiter)
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = read_frame(&mut client).await.unwrap();
+        assert_eq!(
+            response,
+            DaemonResponse::Err {
+                kind: ErrKind::Busy,
+                message: "WSLc daemon exec capacity is exhausted".to_string(),
+            }
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_exec_request_dispatches_successfully() {
+        let session = spawn().unwrap();
+        let exec_limiter = Arc::new(Semaphore::new(1));
+        let (mut client, server) = duplex(64 * 1024);
+        write_frame(
+            &mut client,
+            &DaemonRequest::CancelExec(CancelExecConfig {
+                exec_id: "unknown-exec".to_string(),
+                run_token: "unknown-run".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_client(server, session.clone(), exec_limiter)
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = read_frame(&mut client).await.unwrap();
+        assert_eq!(response, DaemonResponse::Ok);
+        session.shutdown().await.unwrap();
+    }
 
     /// Admit an exec whose output channel is already closed (no live output),
     /// so `write_exec_result` goes straight from `Ok` to the terminal frame.
     fn admitted_no_output(
-        done: oneshot::Receiver<Result<i32, WorkerError>>,
+        done: oneshot::Receiver<Result<ExecTerminal, WorkerError>>,
     ) -> Result<ExecStream, WorkerError> {
         let (tx, output) = mpsc::channel(16);
         drop(tx);
@@ -599,6 +702,7 @@ mod tests {
             done,
             output,
             overflowed: Arc::new(AtomicBool::new(false)),
+            registration: test_registration(),
         })
     }
 
@@ -651,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_completion_channel_yields_single_error_terminal() {
         let (mut server, mut client) = duplex(64 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<i32, WorkerError>>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
         drop(done_tx);
 
         write_exec_result(&mut server, admitted_no_output(done_rx))
@@ -680,8 +784,8 @@ mod tests {
     #[tokio::test]
     async fn successful_exec_writes_ok_then_exit() {
         let (mut server, mut client) = duplex(64 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<i32, WorkerError>>();
-        done_tx.send(Ok(7)).unwrap();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
+        done_tx.send(Ok(ExecTerminal::Exited(7))).unwrap();
 
         write_exec_result(&mut server, admitted_no_output(done_rx))
             .await
@@ -694,13 +798,101 @@ mod tests {
         assert_eq!(terminal, StreamFrame::Exit { code: 7 });
     }
 
+    #[tokio::test]
+    async fn exec_id_stays_registered_until_terminal_delivery() {
+        let active_execs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let registration =
+            Arc::new(register_exec(&active_execs, "exec-1", "run-1", &cancellation).unwrap());
+        let worker_registration = Arc::clone(&registration);
+        let (mut server, mut client) = duplex(1);
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
+        done_tx.send(Ok(ExecTerminal::Exited(0))).unwrap();
+        let (output_tx, output) = mpsc::channel(1);
+        drop(output_tx);
+
+        let writer = tokio::spawn(async move {
+            write_exec_result(
+                &mut server,
+                Ok(ExecStream {
+                    done: done_rx,
+                    output,
+                    overflowed: Arc::new(AtomicBool::new(false)),
+                    registration,
+                }),
+            )
+            .await
+        });
+
+        assert_eq!(
+            read_frame::<_, DaemonResponse>(&mut client).await.unwrap(),
+            DaemonResponse::Ok
+        );
+        drop(worker_registration);
+        tokio::task::yield_now().await;
+
+        let replacement = Arc::new(AtomicBool::new(false));
+        let error = register_exec(&active_execs, "exec-1", "run-2", &replacement).unwrap_err();
+        assert_eq!(error.kind(), ErrKind::Rejected);
+
+        assert_eq!(
+            read_frame::<_, StreamFrame>(&mut client).await.unwrap(),
+            StreamFrame::Exit { code: 0 }
+        );
+        writer.await.unwrap().unwrap();
+
+        let replacement_registration =
+            register_exec(&active_execs, "exec-1", "run-2", &replacement).unwrap();
+        drop(replacement_registration);
+    }
+
+    #[tokio::test]
+    async fn timeout_writes_a_typed_terminal_frame() {
+        let (mut server, mut client) = duplex(64 * 1024);
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
+        done_tx.send(Ok(ExecTerminal::TimedOut)).unwrap();
+
+        write_exec_result(&mut server, admitted_no_output(done_rx))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_frame::<_, DaemonResponse>(&mut client).await.unwrap(),
+            DaemonResponse::Ok
+        );
+        assert_eq!(
+            read_frame::<_, StreamFrame>(&mut client).await.unwrap(),
+            StreamFrame::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_writes_a_typed_terminal_frame() {
+        let (mut server, mut client) = duplex(64 * 1024);
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
+        done_tx.send(Ok(ExecTerminal::Cancelled)).unwrap();
+
+        write_exec_result(&mut server, admitted_no_output(done_rx))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_frame::<_, DaemonResponse>(&mut client).await.unwrap(),
+            DaemonResponse::Ok
+        );
+        assert_eq!(
+            read_frame::<_, StreamFrame>(&mut client).await.unwrap(),
+            StreamFrame::Cancelled
+        );
+    }
+
     /// Live output is streamed as `Stdout`/`Stderr` frames — in the order the
     /// worker enqueued them — before the terminal `Exit`, so the client sees the
     /// run's output incrementally rather than as one buffered blob.
     #[tokio::test]
     async fn live_output_streams_before_exit() {
         let (mut server, mut client) = duplex(64 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<i32, WorkerError>>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
         let (out_tx, output) = mpsc::channel(16);
 
         // Enqueue interleaved output, then the exit code, then close the channel
@@ -714,7 +906,7 @@ mod tests {
         out_tx
             .try_send((OutStream::Stdout, b"world".to_vec()))
             .unwrap();
-        done_tx.send(Ok(0)).unwrap();
+        done_tx.send(Ok(ExecTerminal::Exited(0))).unwrap();
         drop(out_tx);
 
         write_exec_result(
@@ -723,6 +915,7 @@ mod tests {
                 done: done_rx,
                 output,
                 overflowed: Arc::new(AtomicBool::new(false)),
+                registration: test_registration(),
             }),
         )
         .await
@@ -763,7 +956,7 @@ mod tests {
     #[tokio::test]
     async fn leak_path_drains_queued_then_terminates() {
         let (mut server, mut client) = duplex(64 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<i32, WorkerError>>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
         let (out_tx, output) = mpsc::channel(16);
 
         // Two chunks already queued, the run reports its exit, and the sender is
@@ -774,7 +967,7 @@ mod tests {
         out_tx
             .try_send((OutStream::Stderr, b"tail".to_vec()))
             .unwrap();
-        done_tx.send(Ok(3)).unwrap();
+        done_tx.send(Ok(ExecTerminal::Exited(3))).unwrap();
 
         write_exec_result(
             &mut server,
@@ -782,6 +975,7 @@ mod tests {
                 done: done_rx,
                 output,
                 overflowed: Arc::new(AtomicBool::new(false)),
+                registration: test_registration(),
             }),
         )
         .await
@@ -824,12 +1018,12 @@ mod tests {
     #[tokio::test]
     async fn continuous_producer_does_not_starve_terminal() {
         let (mut server, mut client) = duplex(64 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<i32, WorkerError>>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
         // Small queue so a fast producer keeps it perpetually non-empty.
         let (out_tx, output) = mpsc::channel(4);
 
         // Completion is already ready before the handler runs.
-        done_tx.send(Ok(5)).unwrap();
+        done_tx.send(Ok(ExecTerminal::Exited(5))).unwrap();
         // A producer that keeps enqueuing (the leaked `IoContext` on the kill
         // path). It races the handler; `send` errors once the receiver closes,
         // ending the task — so this never leaks past the test.
@@ -855,6 +1049,7 @@ mod tests {
                     done: done_rx,
                     output,
                     overflowed: Arc::new(AtomicBool::new(false)),
+                    registration: test_registration(),
                 }),
             ),
         )
@@ -890,7 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn overflow_yields_truncation_error_terminal() {
         let (mut server, mut client) = duplex(64 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<i32, WorkerError>>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ExecTerminal, WorkerError>>();
         let (out_tx, output) = mpsc::channel(16);
 
         // Some output made it through before the drop, then a clean exit, but the
@@ -898,7 +1093,7 @@ mod tests {
         out_tx
             .try_send((OutStream::Stdout, b"partial".to_vec()))
             .unwrap();
-        done_tx.send(Ok(0)).unwrap();
+        done_tx.send(Ok(ExecTerminal::Exited(0))).unwrap();
         drop(out_tx);
         let overflowed = Arc::new(AtomicBool::new(true));
 
@@ -908,6 +1103,7 @@ mod tests {
                 done: done_rx,
                 output,
                 overflowed,
+                registration: test_registration(),
             }),
         )
         .await

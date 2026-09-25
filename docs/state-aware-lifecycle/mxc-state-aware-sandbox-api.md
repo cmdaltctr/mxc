@@ -469,22 +469,16 @@ function startSandbox<C extends StateAwareContainmentBackend>(
   options?: SandboxSpawnOptions,
 ): Promise<StartResult<C>>;
 
-function execInSandbox(
-  sandboxId: SandboxId<'isolation_session'>,
-  config: IsolationSessionExecConfig,
+function execInSandbox<C extends 'isolation_session' | 'wslc'>(
+  sandboxId: SandboxId<C>,
+  config: ExecConfigFor<C>,
   options?: StateAwareStreamingOptions,
 ): MxcSandboxProcess;
 
-function execInSandboxAsync(
-  sandboxId: SandboxId<'isolation_session'>,
-  config: IsolationSessionExecConfig,
-  options?: SandboxSpawnOptions,
-): Promise<ExecResult>;
-
-function execInSandboxAsync<C extends StateAwareContainmentBackend>(
+function execInSandboxAsync<C extends 'isolation_session' | 'wslc'>(
   sandboxId: SandboxId<C>,
   config: ExecConfigFor<C>,
-  options: SandboxSpawnOptions & { dryRun: true },
+  options?: SandboxSpawnOptions,
 ): Promise<ExecResult>;
 
 function stopSandbox<C extends StateAwareContainmentBackend>(
@@ -500,12 +494,12 @@ function deprovisionSandbox<C extends StateAwareContainmentBackend>(
 ): Promise<DeprovisionResult<C>>;
 ```
 
-For IsolationSession, `execInSandbox` returns an owning `MxcSandboxProcess` for
-live stdin/stdout/stderr, waiting, termination, and disposal.
+For IsolationSession and WSLC, `execInSandbox` returns an owning
+`MxcSandboxProcess` for live output, waiting, termination, and disposal.
+IsolationSession also exposes stdin; WSLC currently exposes stdout/stderr only.
 `execInSandboxAsync` is a buffered convenience that accumulates output and
-resolves on exit. Windows Sandbox and WSLC do not expose piped native exec
-streams, so Node supports only `execInSandboxAsync(..., { dryRun: true })` for
-their exec requests.
+resolves on exit. Windows Sandbox does not expose piped native exec streams, so
+Node does not expose its exec phase, including dry-run.
 
 `provisionSandbox` takes `containment` as its first argument, binding the backend choice
 into the returned `SandboxId<C>`. Subsequent calls (`startSandbox`, `execInSandbox` /

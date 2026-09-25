@@ -14,6 +14,12 @@
 //! Windows-only: the daemon and its pipe transport are a Windows feature.
 
 use std::io::Write;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::Arc;
 
 use wxc_common::logger::{Logger, Mode};
 #[cfg(test)]
@@ -27,7 +33,7 @@ use wxc_common::state_aware_backend::{
 use wxc_common::validator::validate_state_aware_network_policy_support;
 
 use crate::container_steps::OutStream;
-use crate::daemon_client::{DaemonClient, DaemonError};
+use crate::daemon_client::{DaemonClient, DaemonError, DaemonExecOutcome};
 use crate::daemon_protocol::{
     DeprovisionConfig, ErrKind, ExecConfig, NetworkMode, ProvisionConfig, StartConfig, StopConfig,
     VolumeMount,
@@ -35,9 +41,21 @@ use crate::daemon_protocol::{
 use crate::policy::{
     exec_proxy_url, validate_exec_policy, validate_post_provision_policy, validate_provision_policy,
 };
+#[cfg(windows)]
+use crate::sandbox::prepare_native_output;
+#[cfg(windows)]
+use crate::stream_buffer::bounded_stream_pair;
 
 /// Default image when a provision request omits `wslc.provision.image`.
 const DEFAULT_IMAGE: &str = "alpine:latest";
+
+/// Per-stream ceiling between daemon frames and the synthesized native pipe.
+///
+/// The relay must keep consuming until the terminal frame, so it cannot block
+/// when a caller leaves its native pipe unread. Crossing this ceiling drops the
+/// remaining output and turns an otherwise successful exit into an error.
+#[cfg(windows)]
+const PIPE_BRIDGE_MAX_BUFFERED_BYTES: usize = 8 * 1024 * 1024;
 
 /// State-aware WSLc backend. Zero-sized: every phase opens a fresh
 /// [`DaemonClient`] connection (the daemon holds all persistent state).
@@ -129,12 +147,9 @@ impl StatefulSandboxBackend for WslcStateAwareRunner {
         Ok(DeprovisionResult { metadata: None })
     }
 
-    /// Runs one command in the warm container, relaying its stdout/stderr to the
-    /// calling process's own stdio **live** as the daemon streams it, then hands
-    /// back an
-    /// [`ExecHandle`] with sentinel pipe handles and a waiter that yields the
-    /// captured exit code (so the dispatcher's `relay_exec_to_stdio` is a thin
-    /// call-through, mirroring the IsolationSession and Windows Sandbox backends).
+    /// Runs one command in the warm container. Relayed callers receive live
+    /// output on this process's stdout/stderr; piped callers receive synthesized
+    /// native stdout/stderr pipes fed from the same daemon stream.
     fn exec(
         &mut self,
         sandbox_id: &str,
@@ -142,15 +157,6 @@ impl StatefulSandboxBackend for WslcStateAwareRunner {
         _config: Option<()>,
         stdio: ExecStdio,
     ) -> Result<ExecHandle, MxcError> {
-        // Before any work: this backend relays to the calling process's stdio, so it
-        // cannot return exec streams to the caller, and running the workload first
-        // would make the refusal a lie about what has already happened.
-        if stdio == ExecStdio::Piped {
-            return Err(wxc_common::state_aware_backend::unsupported_piped_exec(
-                "WSLc",
-            ));
-        }
-
         // Cooperative proxy: inject HTTP(S)_PROXY (and scrub caller-supplied
         // proxy vars). `exec_proxy_url` yields the routable URL only when the
         // proxy is enabled *and* in the required `url` form — `validate_exec`
@@ -165,66 +171,22 @@ impl StatefulSandboxBackend for WslcStateAwareRunner {
         };
 
         let client = connect_daemon()?;
-
-        // Relay each chunk to our own stdio as it arrives. Hold the stdout/stderr
-        // locks for the whole relay so we don't reacquire the handle per chunk,
-        // and coalesce flushes: `std::io::Stdout`/`Stderr` are line-buffered, so
-        // newline-terminated output already reaches the consumer promptly; we only
-        // force a flush for a chunk that does *not* end in a newline (progress
-        // output — prompts, spinners) so it isn't stranded in the line buffer.
-        // This avoids a flush syscall per bulk chunk while preserving low latency.
-        // Best-effort: a failed local write must not mask the container's exit code.
-        let stdout = std::io::stdout();
-        let stderr = std::io::stderr();
-        let exit_code = {
-            let mut out = stdout.lock();
-            let mut err = stderr.lock();
-            let result = client.exec_streaming(
-                ExecConfig {
-                    sandbox_id: sandbox_id.to_string(),
-                    script_code: request.script_code.clone(),
-                    working_directory: request.working_directory.clone(),
-                    env,
-                    timeout_ms: request.script_timeout,
-                },
-                |stream, bytes| match stream {
-                    OutStream::Stdout => {
-                        let _ = out.write_all(bytes);
-                        if bytes.last() != Some(&b'\n') {
-                            let _ = out.flush();
-                        }
-                    }
-                    OutStream::Stderr => {
-                        let _ = err.write_all(bytes);
-                        if bytes.last() != Some(&b'\n') {
-                            let _ = err.flush();
-                        }
-                    }
-                },
-            );
-            let _ = out.flush();
-            let _ = err.flush();
-            // Drop the locks before mapping the error so error conversion never
-            // contends with the writers we just held.
-            drop((out, err));
-            result.map_err(map_daemon_error)?
+        let exec_id = uuid::Uuid::new_v4().simple().to_string();
+        let run_token = uuid::Uuid::new_v4().simple().to_string();
+        let config = ExecConfig {
+            exec_id: exec_id.clone(),
+            run_token: run_token.clone(),
+            sandbox_id: sandbox_id.to_string(),
+            script_code: request.script_code.clone(),
+            working_directory: request.working_directory.clone(),
+            env,
+            timeout_ms: request.script_timeout,
         };
 
-        Ok(ExecHandle {
-            stdout: null_pipe_handle(),
-            stderr: null_pipe_handle(),
-            stdin: null_pipe_handle(),
-            stdin_closer: None,
-            // `Exited`, not `TimedOut`: this backend relays internally and has
-            // already run the workload to completion by the time it returns, so
-            // `exit_code` is whatever the container reported — including for a
-            // workload the daemon timed out. Reporting a timeout as such needs
-            // the `Piped` path this backend does not have yet.
-            waiter: Box::new(move || Ok(ExecOutcome::Exited(exit_code))),
-            // Nothing to terminate: the workload is already gone. `Ok(())` is
-            // the truthful answer here, not a placeholder.
-            terminator: Box::new(|| Ok(())),
-        })
+        match stdio {
+            ExecStdio::Relayed => exec_relayed(client, config),
+            ExecStdio::Piped => exec_piped(client, config, exec_id, run_token),
+        }
     }
 
     fn validate_provision(
@@ -294,6 +256,187 @@ impl StatefulSandboxBackend for WslcStateAwareRunner {
         )?;
         validate_post_provision_policy(request)
     }
+}
+
+fn exec_relayed(client: DaemonClient, config: ExecConfig) -> Result<ExecHandle, MxcError> {
+    let timeout_ms = config.timeout_ms;
+
+    // Relay each chunk to our own stdio as it arrives. Hold the stdout/stderr
+    // locks for the whole relay so we don't reacquire the handle per chunk,
+    // and coalesce flushes: `std::io::Stdout`/`Stderr` are line-buffered, so
+    // newline-terminated output already reaches the consumer promptly; we only
+    // force a flush for a chunk that does *not* end in a newline (progress
+    // output — prompts, spinners) so it isn't stranded in the line buffer.
+    // This avoids a flush syscall per bulk chunk while preserving low latency.
+    // Best-effort: a failed local write must not mask the container's exit code.
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let exit_code = {
+        let mut out = stdout.lock();
+        let mut err = stderr.lock();
+        let result = client.exec_streaming(config, |stream, bytes| match stream {
+            OutStream::Stdout => {
+                let _ = out.write_all(bytes);
+                if bytes.last() != Some(&b'\n') {
+                    let _ = out.flush();
+                }
+            }
+            OutStream::Stderr => {
+                let _ = err.write_all(bytes);
+                if bytes.last() != Some(&b'\n') {
+                    let _ = err.flush();
+                }
+            }
+        });
+        let _ = out.flush();
+        let _ = err.flush();
+        // Drop the locks before mapping the error so error conversion never
+        // contends with the writers we just held.
+        drop((out, err));
+        result.map_err(map_daemon_error)?
+    };
+
+    let exit_code = match exit_code {
+        DaemonExecOutcome::Exited(code) => code,
+        DaemonExecOutcome::TimedOut => {
+            return Err(MxcError::backend_error(format!(
+                "WSLc exec timed out after {timeout_ms}ms"
+            )))
+        }
+        DaemonExecOutcome::Cancelled => {
+            return Err(MxcError::backend_error(
+                "WSLc relayed exec was cancelled unexpectedly",
+            ))
+        }
+    };
+
+    Ok(ExecHandle {
+        stdout: null_pipe_handle(),
+        stderr: null_pipe_handle(),
+        stdin: null_pipe_handle(),
+        stdin_closer: None,
+        // Relayed execution has already completed before this handle is
+        // returned; timeouts were surfaced above as an error because the
+        // relay adapter has no typed timeout result.
+        waiter: Box::new(move || Ok(ExecOutcome::Exited(exit_code))),
+        // Nothing to terminate: the workload is already gone. `Ok(())` is
+        // the truthful answer here, not a placeholder.
+        terminator: Box::new(|| Ok(())),
+    })
+}
+
+#[cfg(windows)]
+fn exec_piped(
+    client: DaemonClient,
+    config: ExecConfig,
+    exec_id: String,
+    run_token: String,
+) -> Result<ExecHandle, MxcError> {
+    let stdout_pipe = prepare_native_output()
+        .map_err(|error| MxcError::backend_error(format!("create WSLC stdout pipe: {error}")))?;
+    let stderr_pipe = prepare_native_output()
+        .map_err(|error| MxcError::backend_error(format!("create WSLC stderr pipe: {error}")))?;
+    let (stdout_writer, stdout_source, stdout_overflow) =
+        bounded_stream_pair(PIPE_BRIDGE_MAX_BUFFERED_BYTES);
+    let (stderr_writer, stderr_source, stderr_overflow) =
+        bounded_stream_pair(PIPE_BRIDGE_MAX_BUFFERED_BYTES);
+    let (stdout_reader, stdout_pump) = stdout_pipe
+        .activate(stdout_source)
+        .map_err(|error| MxcError::backend_error(format!("start WSLC stdout pump: {error}")))?;
+    let (stderr_reader, stderr_pump) = stderr_pipe
+        .activate(stderr_source)
+        .map_err(|error| MxcError::backend_error(format!("start WSLC stderr pump: {error}")))?;
+    let stdout = windows::Win32::Foundation::HANDLE(stdout_reader.as_raw_handle());
+    let stderr = windows::Win32::Foundation::HANDLE(stderr_reader.as_raw_handle());
+    let terminator_client = client.clone();
+    let relay_exec_id = exec_id.clone();
+    let relay_run_token = run_token.clone();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let relay_cancellation = Arc::clone(&cancellation);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::Builder::new()
+        .name("wslc-state-aware-exec".to_string())
+        .spawn(move || {
+            let result = client
+                .admit_exec(config)
+                .and_then(|exec| {
+                    if relay_cancellation.load(Ordering::Acquire) {
+                        client.cancel_exec(relay_exec_id, relay_run_token)?;
+                    }
+                    exec.read_to_completion(|stream, bytes| match stream {
+                        OutStream::Stdout => stdout_writer.write(bytes),
+                        OutStream::Stderr => stderr_writer.write(bytes),
+                    })
+                })
+                .map(|outcome| match outcome {
+                    DaemonExecOutcome::Exited(code) => ExecOutcome::Exited(code),
+                    DaemonExecOutcome::TimedOut => ExecOutcome::TimedOut,
+                    // `SandboxProcess::kill` is a request followed by reaping;
+                    // there is no distinct cancelled variant in `ExecOutcome`.
+                    DaemonExecOutcome::Cancelled => ExecOutcome::Exited(-1),
+                })
+                .map_err(map_daemon_error);
+            let result = match result {
+                Ok(ExecOutcome::Exited(_))
+                    if stdout_overflow.has_overflowed() || stderr_overflow.has_overflowed() =>
+                {
+                    Err(MxcError::backend_error(
+                        "WSLc live output was truncated because the caller did not drain the \
+                         synthesized stdout/stderr pipes fast enough",
+                    ))
+                }
+                other => other,
+            };
+            stdout_writer.close();
+            stderr_writer.close();
+            let _ = done_tx.send(result);
+            // Caller-owned pipes can remain full when the caller uses
+            // `try_wait` or drops without draining. Joining the pumps here
+            // would then block terminal completion and create a Drop cycle.
+            // Dropping a JoinHandle detaches the pump; closing the read end
+            // during ExecHandle teardown lets the blocked write unwind.
+            drop(stdout_pump);
+            drop(stderr_pump);
+        })
+        .map_err(|error| {
+            MxcError::backend_error(format!("start WSLC exec stream thread: {error}"))
+        })?;
+
+    Ok(ExecHandle {
+        stdout,
+        stderr,
+        stdin: null_pipe_handle(),
+        stdin_closer: None,
+        waiter: Box::new(move || {
+            // Keep the original read handles alive until the generic adapter has
+            // duplicated them and the daemon stream reaches a terminal frame.
+            let _readers = (stdout_reader, stderr_reader);
+            done_rx.recv().map_err(|_| {
+                MxcError::backend_error(
+                    "WSLc exec stream thread ended without reporting an outcome",
+                )
+            })?
+        }),
+        terminator: Box::new(move || {
+            cancellation.store(true, Ordering::Release);
+            terminator_client
+                .cancel_exec(exec_id, run_token)
+                .map_err(map_daemon_error)
+        }),
+    })
+}
+
+#[cfg(not(windows))]
+fn exec_piped(
+    _client: DaemonClient,
+    _config: ExecConfig,
+    _exec_id: String,
+    _run_token: String,
+) -> Result<ExecHandle, MxcError> {
+    Err(MxcError::backend_unavailable(
+        "WSLc piped execution is available only on Windows",
+    ))
 }
 
 /// Discover (or spawn) the daemon. A discovery/spawn failure is a
@@ -457,40 +600,6 @@ mod tests {
     use wxc_common::models::{
         ContainerPolicy, NetworkAction, NetworkEgressPolicy, NetworkIngressPolicy,
     };
-
-    /// A `Piped` exec is refused before the backend touches the daemon.
-    ///
-    /// This backend writes the workload's output to *this process's* stdout and
-    /// stderr, so it cannot return exec streams to the caller. The refusal has to come
-    /// first: the workload is arbitrary and may not be idempotent, so refusing
-    /// after running it would report "unsupported" for something that already
-    /// happened, with its output delivered somewhere the caller never asked for.
-    ///
-    /// The sandbox id is well-formed but names nothing, and there is no daemon
-    /// to connect to. Any error other than the refusal means the guard ran too
-    /// late — the code reached the daemon before checking who was asking.
-    #[test]
-    fn a_piped_exec_is_refused_before_the_workload_runs() {
-        let mut runner = WslcStateAwareRunner::new();
-        let err = runner
-            .exec(
-                "wslc:0123456789abcdef0123456789abcdef",
-                &ExecutionRequest::default(),
-                None,
-                ExecStdio::Piped,
-            )
-            .expect_err("a streams-consuming caller must be refused");
-        assert!(
-            err.message.contains("cannot return exec streams"),
-            "expected the shared refusal before any daemon work, got: {}",
-            err.message
-        );
-        assert!(
-            err.message.contains("Nothing has been run"),
-            "the refusal must state that no workload ran: {}",
-            err.message
-        );
-    }
 
     #[test]
     fn backend_key_matches_wire_format() {

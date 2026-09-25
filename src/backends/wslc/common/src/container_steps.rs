@@ -36,12 +36,15 @@
 use std::ffi::c_void;
 use std::fmt::Write;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wxc_common::logger::Logger;
 use wxc_common::models::{PortMapping, ScriptResponse};
 use wxc_common::string_util::{to_wide, CoTaskMemPWSTR};
+
+use crate::daemon_protocol::ExecTerminal;
 
 use crate::error::WslcError;
 use crate::policy_mapping::VolumeMount;
@@ -882,19 +885,166 @@ pub unsafe fn start_daemon_container(
     Ok(())
 }
 
-/// Captured result of a daemon `exec`. Live bidirectional streaming is a later
-/// fill-in; for now the whole stdout/stderr is captured and the exit code
-/// returned once the process completes.
+/// Maximum delay before observing cancellation while waiting for process exit.
+const EXEC_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bounded wait for the SDK exit callback to confirm termination and flush I/O.
+const EXIT_CALLBACK_WAIT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecInterruption {
+    TimedOut,
+    Cancelled,
+}
+
+impl ExecInterruption {
+    fn get_interruption_word(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timeout",
+            Self::Cancelled => "cancellation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitWait {
+    Signalled,
+    Interrupted(ExecInterruption),
+    NoEvent,
+    Failed { wait_result: u32, last_error: u32 },
+}
+
+fn wait_slice(timeout: Option<Duration>, elapsed: Duration) -> Duration {
+    timeout
+        .map(|limit| limit.saturating_sub(elapsed))
+        .unwrap_or(EXEC_WAIT_POLL_INTERVAL)
+        .min(EXEC_WAIT_POLL_INTERVAL)
+}
+
+fn wait_slice_ms(timeout: Option<Duration>, elapsed: Duration) -> u32 {
+    u32::try_from(wait_slice(timeout, elapsed).as_millis())
+        .expect("poll interval is bounded to 100ms")
+}
+
+fn requested_interruption(
+    cancelled: bool,
+    timeout: Option<Duration>,
+    elapsed: Duration,
+) -> Option<ExecInterruption> {
+    if cancelled {
+        Some(ExecInterruption::Cancelled)
+    } else if timeout.is_some_and(|limit| elapsed >= limit) {
+        Some(ExecInterruption::TimedOut)
+    } else {
+        None
+    }
+}
+
+/// Wait for process exit or a cancellation/timeout request.
+///
+/// # Safety
+/// `exit_event` must be null or a valid waitable event handle for the duration
+/// of this call.
+unsafe fn wait_for_exit_event(
+    exit_event: HANDLE,
+    io_ctx: &IoContext,
+    timeout: Option<Duration>,
+    cancellation: &AtomicBool,
+) -> ExitWait {
+    let started = Instant::now();
+    loop {
+        if let Some(interruption) = requested_interruption(
+            cancellation.load(Ordering::Acquire),
+            timeout,
+            started.elapsed(),
+        ) {
+            return ExitWait::Interrupted(interruption);
+        }
+
+        if exit_event.is_null() {
+            if wait_for_exit_callback_slice(io_ctx, wait_slice(timeout, started.elapsed())) {
+                return ExitWait::NoEvent;
+            }
+            continue;
+        }
+
+        let wait_result = unsafe {
+            windows::Win32::System::Threading::WaitForSingleObject(
+                windows::Win32::Foundation::HANDLE(exit_event),
+                wait_slice_ms(timeout, started.elapsed()),
+            )
+        };
+        if wait_result == windows::Win32::Foundation::WAIT_OBJECT_0 {
+            return ExitWait::Signalled;
+        }
+        if wait_result != windows::Win32::Foundation::WAIT_TIMEOUT {
+            let last_error = unsafe { windows::Win32::Foundation::GetLastError() };
+            return ExitWait::Failed {
+                wait_result: wait_result.0,
+                last_error: last_error.0,
+            };
+        }
+    }
+}
+
+fn wait_for_exit_callback_slice(io_ctx: &IoContext, wait: Duration) -> bool {
+    let (lock, cvar) = &*io_ctx.exited;
+    let mut exited = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !*exited {
+        let result = cvar
+            .wait_timeout(exited, wait)
+            .unwrap_or_else(|e| e.into_inner());
+        exited = result.0;
+    }
+    *exited
+}
+
+fn wait_for_exit_callback(io_ctx: &IoContext) -> bool {
+    wait_for_exit_callback_slice(io_ctx, EXIT_CALLBACK_WAIT)
+}
+
+/// Terminal state of a daemon container process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessCompletion {
+    Confirmed(ExecTerminal),
+    /// The process could not be positively confirmed dead. The owning
+    /// container must be quarantined and never reused.
+    TerminationUnconfirmed,
+}
+
+fn natural_exit_confirmed(exit_wait: ExitWait, callback_confirmed: bool) -> bool {
+    matches!(exit_wait, ExitWait::Signalled)
+        || (matches!(exit_wait, ExitWait::NoEvent) && callback_confirmed)
+}
+
+fn classify_completion(exit_wait: ExitWait, confirmed: bool, exit_code: i32) -> ProcessCompletion {
+    if natural_exit_confirmed(exit_wait, confirmed) {
+        return ProcessCompletion::Confirmed(ExecTerminal::Exited(exit_code));
+    }
+
+    match exit_wait {
+        ExitWait::Interrupted(ExecInterruption::TimedOut) if confirmed => {
+            ProcessCompletion::Confirmed(ExecTerminal::TimedOut)
+        }
+        ExitWait::Interrupted(ExecInterruption::Cancelled) if confirmed => {
+            ProcessCompletion::Confirmed(ExecTerminal::Cancelled)
+        }
+        ExitWait::Interrupted(_) | ExitWait::Failed { .. } => {
+            ProcessCompletion::TerminationUnconfirmed
+        }
+        ExitWait::NoEvent | ExitWait::Signalled => ProcessCompletion::TerminationUnconfirmed,
+    }
+}
+
+/// Result of a daemon `exec`, including captured output retained by callbacks.
+#[derive(Debug)]
 pub struct ExecOutcome {
-    pub exit_code: i32,
-    pub timed_out: bool,
-    /// Set when the process could not be positively confirmed to have ended:
-    /// no exit event and no exit callback, or a timeout `SIGKILL` that did not
-    /// land. The container is then in an unknown state and the caller must
-    /// quarantine it rather than reuse it for a later exec.
-    pub terminated_unconfirmed: bool,
+    pub completion: ProcessCompletion,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Specific post-process-creation failure that made termination
+    /// unobservable. The daemon uses this context when quarantining.
+    pub post_launch_error: Option<ScriptResponse>,
 }
 
 /// Run `script_code` (under `/bin/sh -c`) as a fresh process inside a started
@@ -905,10 +1055,10 @@ pub struct ExecOutcome {
 /// # Safety
 /// `sdk` must hold valid function pointers and `container` must be a live,
 /// started handle.
-// A thin FFI primitive whose parameters mirror the SDK's process inputs plus
-// the optional live-output sink; grouping them into a struct would only add an
-// indirection for a single call site.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "thin FFI boundary mirrors the SDK process inputs at its single call site"
+)]
 pub unsafe fn exec_in_container(
     sdk: &WslcSdk,
     container: WslcContainer,
@@ -916,6 +1066,7 @@ pub unsafe fn exec_in_container(
     env: &[String],
     working_directory: &str,
     timeout_ms: u32,
+    cancellation: &AtomicBool,
     sink: Option<OutputSink>,
     logger: &mut Logger,
 ) -> Result<ExecOutcome, ScriptResponse> {
@@ -945,87 +1096,66 @@ pub unsafe fn exec_in_container(
     let mut exit_event: HANDLE = ptr::null_mut();
     let hr = sdk.WslcGetProcessExitEvent(process_guard.as_raw(), &mut exit_event);
     if hr != S_OK {
-        return Err(sdk_error("WslcGetProcessExitEvent failed", hr, ""));
+        return Ok(ExecOutcome {
+            completion: ProcessCompletion::TerminationUnconfirmed,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            post_launch_error: Some(sdk_error("WslcGetProcessExitEvent failed", hr, "")),
+        });
     }
 
-    let wait_ms = if timeout_ms > 0 { timeout_ms } else { u32::MAX };
+    let timeout = (timeout_ms > 0).then(|| Duration::from_millis(u64::from(timeout_ms)));
+    let exit_wait =
+        wait_for_exit_event(exit_event, process_settings.io_ctx(), timeout, cancellation);
 
-    // Positive-confirmation tracking. Reporting a clean exit requires proof the
-    // process actually ended — either the exit event signalling or the SDK's
-    // exit callback firing. Without either, `WslcGetProcessExitCode` returns
-    // `STILL_ACTIVE` for a process that is very much still running, so it must
-    // never be reported as an exit code.
-    let mut timed_out = false;
-    let mut exit_signalled = false;
-    // Set when the process cannot be confirmed terminated (no exit proof, or a
-    // timeout SIGKILL that did not land); the container is then compromised.
-    let mut terminated_unconfirmed = false;
-
-    if !exit_event.is_null() {
-        let wait_result = windows::Win32::System::Threading::WaitForSingleObject(
-            windows::Win32::Foundation::HANDLE(exit_event),
-            wait_ms,
+    if let ExitWait::Failed {
+        wait_result,
+        last_error,
+    } = exit_wait
+    {
+        let _ = writeln!(
+            logger,
+            "[WSLC][daemon] Warning: waiting on the exec exit event failed: \
+             WaitForSingleObject returned 0x{wait_result:08X} \
+             (GetLastError 0x{last_error:08X}); container state is unknown"
         );
-        if wait_result == windows::Win32::Foundation::WAIT_OBJECT_0 {
-            exit_signalled = true;
-        } else if wait_result == windows::Win32::Foundation::WAIT_TIMEOUT {
-            timed_out = true;
+    }
+
+    let interruption = match exit_wait {
+        ExitWait::Interrupted(interruption) => Some(interruption),
+        _ => None,
+    };
+    if let Some(interruption) = interruption {
+        let _ = writeln!(
+            logger,
+            "[WSLC][daemon] exec {} — killing process",
+            interruption.get_interruption_word()
+        );
+        // Kill only this process; the keepalive init keeps the container up.
+        let kill_hr =
+            sdk.WslcSignalProcess(process_guard.as_raw(), WslcSignal::WSLC_SIGNAL_SIGKILL);
+        if kill_hr != S_OK {
             let _ = writeln!(
                 logger,
-                "[WSLC][daemon] exec timeout ({}ms) reached — killing process",
-                wait_ms
+                "[WSLC][daemon] Warning: WslcSignalProcess(SIGKILL) failed (hr=0x{:08X}); \
+                 process may still be running",
+                kill_hr as u32
             );
-            // Kill only this process; the keepalive init keeps the container up.
-            let kill_hr =
-                sdk.WslcSignalProcess(process_guard.as_raw(), WslcSignal::WSLC_SIGNAL_SIGKILL);
-            if kill_hr != S_OK {
-                let _ = writeln!(
-                    logger,
-                    "[WSLC][daemon] Warning: WslcSignalProcess(SIGKILL) failed (hr=0x{:08X}); \
-                     process may still be running",
-                    kill_hr as u32
-                );
-            }
-        } else {
-            // WAIT_FAILED / WAIT_ABANDONED / anything else: the wait told us
-            // nothing about the process, so it cannot be claimed exited or
-            // killed. Treat the container as compromised.
-            let last_error = windows::Win32::Foundation::GetLastError();
-            let _ = writeln!(
-                logger,
-                "[WSLC][daemon] Warning: waiting on the exec exit event failed: \
-                 WaitForSingleObject returned 0x{:08X} (GetLastError 0x{:08X}); \
-                 container state is unknown",
-                wait_result.0, last_error.0
-            );
-            terminated_unconfirmed = true;
         }
     }
 
     // Wait for the exit callback — the only proof the process is actually gone
     // and that all captured I/O has been flushed.
-    let wait_for_exit_callback = || {
-        let (lock, cvar) = &*process_settings.io_ctx().exited;
-        let mut exited = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if !*exited {
-            let result = cvar
-                .wait_timeout(exited, Duration::from_secs(30))
-                .unwrap_or_else(|e| e.into_inner());
-            exited = result.0;
-        }
-        *exited
-    };
-
-    let mut confirmed = wait_for_exit_callback();
-    if timed_out && !confirmed {
+    let mut confirmed = wait_for_exit_callback(process_settings.io_ctx());
+    if interruption.is_some() && !confirmed {
         // The SIGKILL was only a request and plainly has not landed yet; give
         // the callback one more bounded chance before declaring the outcome
         // unconfirmed.
-        confirmed = wait_for_exit_callback();
+        confirmed = wait_for_exit_callback(process_settings.io_ctx());
         if !confirmed {
             let _ = writeln!(
                 logger,
-                "[WSLC][daemon] Warning: exit callback did not fire after the timeout SIGKILL; \
+                "[WSLC][daemon] Warning: exit callback did not fire after SIGKILL; \
                  process may still be running"
             );
         }
@@ -1033,8 +1163,16 @@ pub unsafe fn exec_in_container(
 
     let mut exit_code: i32 = -1;
     let hr = sdk.WslcGetProcessExitCode(process_guard.as_raw(), &mut exit_code);
-    if hr != S_OK && !timed_out {
-        return Err(sdk_error("WslcGetProcessExitCode failed", hr, ""));
+    if hr != S_OK {
+        if natural_exit_confirmed(exit_wait, confirmed) {
+            return Err(sdk_error("WslcGetProcessExitCode failed", hr, ""));
+        }
+        let _ = writeln!(
+            logger,
+            "[WSLC][daemon] Warning: WslcGetProcessExitCode failed while termination was \
+             unconfirmed (hr=0x{:08X})",
+            hr as u32
+        );
     }
 
     let stdout = process_settings
@@ -1051,39 +1189,44 @@ pub unsafe fn exec_in_container(
         .clone();
 
     // Resolve the reported outcome from positive evidence only.
-    if timed_out {
-        if confirmed {
-            let _ = writeln!(logger, "[WSLC][daemon] Process killed after timeout");
-        } else {
-            terminated_unconfirmed = true;
+    let completion = classify_completion(exit_wait, confirmed, exit_code);
+    match completion {
+        ProcessCompletion::Confirmed(ExecTerminal::TimedOut) => {
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] Process killed after {}",
+                ExecInterruption::TimedOut.get_interruption_word()
+            );
         }
-    } else if exit_signalled || confirmed {
-        let _ = writeln!(
-            logger,
-            "[WSLC][daemon] Process exited with code {}",
-            exit_code
-        );
-    } else {
-        // Neither timed out nor confirmed exited: nothing proves the process
-        // ended, so its exit code is meaningless.
-        let _ = writeln!(
-            logger,
-            "[WSLC][daemon] Warning: exec never reported an exit (no exit event, no exit \
-             callback); container state is unknown"
-        );
-        terminated_unconfirmed = true;
+        ProcessCompletion::Confirmed(ExecTerminal::Cancelled) => {
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] Process killed after {}",
+                ExecInterruption::Cancelled.get_interruption_word()
+            );
+        }
+        ProcessCompletion::Confirmed(ExecTerminal::Exited(exit_code)) => {
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] Process exited with code {}",
+                exit_code
+            );
+        }
+        ProcessCompletion::TerminationUnconfirmed if matches!(exit_wait, ExitWait::NoEvent) => {
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] Warning: exec never reported an exit (no exit event, no exit \
+                 callback); container state is unknown"
+            );
+        }
+        ProcessCompletion::TerminationUnconfirmed => {}
     }
 
     Ok(ExecOutcome {
-        exit_code: if timed_out || terminated_unconfirmed {
-            -1
-        } else {
-            exit_code
-        },
-        timed_out,
-        terminated_unconfirmed,
+        completion,
         stdout,
         stderr,
+        post_launch_error: None,
     })
 }
 
@@ -1161,5 +1304,136 @@ mod tests {
             msg.contains("interior NUL"),
             "error explains the cause: {msg}"
         );
+    }
+
+    #[test]
+    fn wait_slice_is_bounded_by_poll_interval_and_deadline() {
+        assert_eq!(wait_slice(None, Duration::ZERO), Duration::from_millis(100));
+        assert_eq!(
+            wait_slice(Some(Duration::from_millis(250)), Duration::from_millis(225),),
+            Duration::from_millis(25)
+        );
+        assert_eq!(wait_slice_ms(None, Duration::ZERO), 100);
+        assert_eq!(
+            wait_slice_ms(Some(Duration::from_millis(250)), Duration::from_millis(25)),
+            100
+        );
+        assert_eq!(
+            wait_slice_ms(Some(Duration::from_millis(250)), Duration::from_millis(225)),
+            25
+        );
+        assert_eq!(
+            wait_slice_ms(Some(Duration::from_millis(250)), Duration::from_millis(250)),
+            0
+        );
+    }
+
+    #[test]
+    fn cancellation_takes_precedence_over_an_expired_timeout() {
+        assert_eq!(
+            requested_interruption(
+                true,
+                Some(Duration::from_millis(10)),
+                Duration::from_millis(10),
+            ),
+            Some(ExecInterruption::Cancelled)
+        );
+    }
+
+    #[test]
+    fn timeout_requires_a_nonzero_deadline_to_expire() {
+        assert_eq!(
+            requested_interruption(false, None, Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            requested_interruption(
+                false,
+                Some(Duration::from_millis(10)),
+                Duration::from_millis(9),
+            ),
+            None
+        );
+        assert_eq!(
+            requested_interruption(
+                false,
+                Some(Duration::from_millis(10)),
+                Duration::from_millis(10),
+            ),
+            Some(ExecInterruption::TimedOut)
+        );
+    }
+
+    #[test]
+    fn completion_classification_requires_positive_exit_evidence() {
+        assert_eq!(
+            classify_completion(ExitWait::Signalled, false, 7),
+            ProcessCompletion::Confirmed(ExecTerminal::Exited(7))
+        );
+        assert_eq!(
+            classify_completion(ExitWait::NoEvent, true, 8),
+            ProcessCompletion::Confirmed(ExecTerminal::Exited(8))
+        );
+        assert_eq!(
+            classify_completion(ExitWait::Interrupted(ExecInterruption::TimedOut), true, -1,),
+            ProcessCompletion::Confirmed(ExecTerminal::TimedOut)
+        );
+        assert_eq!(
+            classify_completion(ExitWait::Interrupted(ExecInterruption::Cancelled), true, -1,),
+            ProcessCompletion::Confirmed(ExecTerminal::Cancelled)
+        );
+        assert_eq!(
+            classify_completion(
+                ExitWait::Interrupted(ExecInterruption::Cancelled),
+                false,
+                -1,
+            ),
+            ProcessCompletion::TerminationUnconfirmed
+        );
+        assert_eq!(
+            classify_completion(
+                ExitWait::Failed {
+                    wait_result: 1,
+                    last_error: 2,
+                },
+                true,
+                0,
+            ),
+            ProcessCompletion::TerminationUnconfirmed
+        );
+        assert_eq!(
+            classify_completion(ExitWait::NoEvent, false, -1),
+            ProcessCompletion::TerminationUnconfirmed
+        );
+    }
+
+    #[test]
+    fn null_exit_event_still_observes_cancellation() {
+        let io_ctx = IoContext {
+            stdout: Arc::new(Mutex::new(Vec::new())),
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            exited: Arc::new((Mutex::new(false), Condvar::new())),
+            sink: None,
+        };
+        let cancellation = AtomicBool::new(true);
+
+        let result = unsafe { wait_for_exit_event(ptr::null_mut(), &io_ctx, None, &cancellation) };
+
+        assert_eq!(result, ExitWait::Interrupted(ExecInterruption::Cancelled));
+    }
+
+    #[test]
+    fn null_exit_event_uses_callback_as_natural_exit_evidence() {
+        let io_ctx = IoContext {
+            stdout: Arc::new(Mutex::new(Vec::new())),
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            exited: Arc::new((Mutex::new(true), Condvar::new())),
+            sink: None,
+        };
+        let cancellation = AtomicBool::new(false);
+
+        let result = unsafe { wait_for_exit_event(ptr::null_mut(), &io_ctx, None, &cancellation) };
+
+        assert_eq!(result, ExitWait::NoEvent);
     }
 }

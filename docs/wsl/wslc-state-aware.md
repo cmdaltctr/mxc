@@ -71,16 +71,46 @@ dispatcher derives the backend from the `wslc:` prefix (they do **not** repeat `
 |-------|--------------------------|
 | provision | Load SDK, `WslcCreateSession`, resolve/import image, `WslcCreateContainer` with a keepalive init process (so the container survives across separate `exec` phases). The container is created **not started** (`started: false`). |
 | start | `WslcStartContainer` — starts the container minted at provision-time (the keepalive init keeps it warm across later `exec` phases); marks it `started`. |
-| exec | `WslcCreateContainerProcess` in the warm container; stream stdout/stderr, forward stdin, return the process exit code. A timeout SIGKILLs the **process**, not the container. |
+| exec | `WslcCreateContainerProcess` in the warm container; stream stdout/stderr and return the process exit code. Stdin is unavailable because the WSLc SDK exposes no process-input API. A timeout or caller cancellation SIGKILLs the **process**, not the container. |
 | stop | `WslcStopContainer`. |
 | deprovision | `WslcDeleteContainer`; release the session + SDK when the last container is gone (daemon may then exit / idle-time out). |
 
 ### exec output semantics
 
 `provision` / `start` / `stop` / `deprovision` return a JSON `{result | error}` envelope on stdout.
-A **successful** `exec` streams the script's raw stdout (relayed from the daemon-captured buffers)
-and exits with the script's own exit code — it does **not** wrap the result in an envelope. Callers
-discriminate via the exit code + whether stdout parses as an envelope.
+For attached execution, a **successful** `exec` relays the script's raw stdout/stderr live from
+daemon frames and exits with the script's own exit code — it does **not** wrap the result in an
+envelope. Piped execution writes those same live frames into separate anonymous stdout/stderr
+pipes returned to the in-process SDK caller; no stdin pipe is returned. Callers discriminate
+attached dispatch failures via the exit code + whether stdout parses as an envelope. A timeout
+on the attached relay surfaces as a backend error because that path cannot return a typed timeout;
+the piped path reports it through its wait result.
+
+### exec admission, cancellation, and failure containment
+
+The daemon runs one exec at a time because all WSLc SDK operations are confined
+to one apartment-affine worker. A concurrent exec is rejected with
+`backend_error` rather than queued behind an unknown-duration workload. Up to
+eight additional control connections can be serviced while an exec owns the
+stream slot; connections beyond the daemon's bounded client capacity are
+refused.
+
+Each exec carries an internal ID and per-run token. A duplicate live ID is
+rejected, and cancellation must match both values so a delayed cancellation
+cannot terminate a later run that reused the same ID. Cancellation observed
+before the worker starts a queued command returns a typed cancelled result
+without creating the process.
+
+Live output uses bounded queues in both the daemon and the in-process native
+pipe bridge. If a caller does not drain stdout/stderr quickly enough, excess
+output is dropped and completion becomes an explicit backend error reporting
+truncation; incomplete output is never reported as successful.
+
+If process termination cannot be positively confirmed after creation, the
+container is quarantined and cannot be started or used for another exec. The
+daemon attempts immediate deletion. If deletion fails, the quarantined entry is
+retained so `deprovision` can retry cleanup; it is not removed from tracking
+while a potentially running workload remains.
 
 ## Policy honor matrix
 
