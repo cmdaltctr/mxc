@@ -237,7 +237,7 @@ policy denial occurrences plus diagnostic outcomes omitted from the policy file:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "signatures": [
     {
       "signature": {
@@ -296,6 +296,10 @@ reason and their sanitized event properties:
   converted to a safe absolute DOS or UNC path. For example,
   `\Device\MountPointManager` is useful Devices-namespace evidence, but it is
   not a directly authorable filesystem grant.
+- `comActivation` and `comInterfaceCall` mark observed classic COM class
+  activation and interface-call access checks: denied under `block`, recorded
+  and allowed under `allow`. The CLSID or IID is retained. A missing identifier
+  is `missingObjectName`; an invalid one is `eventPayloadMalformed`.
 - `unsupportedObjectType` means the event names a resource outside the
   supported diagnostic model. Examples include `\BaseNamedObjects` as a
   Directory, ALPC Ports such as
@@ -312,7 +316,7 @@ Unknown event IDs from known Learning Mode providers are classified as
 PID without attempting an unsupported TDH payload decode.
 
 Per-event TDH failures use closed diagnostic reasons:
-`eventPayloadMalformed` means the payload conflicts with its declared schema,
+`eventPayloadMalformed` means the payload is malformed or conflicts with its declared schema,
 `decoderLimitReached` means a nesting/element/work safety bound stopped
 decoding, and `unsupportedPropertyEncoding` means the decoder cannot consume
 that property shape. When TDH exposes it, the schema-declared name is retained
