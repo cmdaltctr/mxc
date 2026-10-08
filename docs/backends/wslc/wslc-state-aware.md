@@ -40,10 +40,12 @@ the live SDK handles. Each phase process is a thin client that contacts the daem
 pipe; the daemon performs the actual SDK calls and streams stdio back. This mirrors the Windows
 Sandbox daemon pattern.
 
-The daemon runs all SDK calls on a **single apartment-affine worker thread** (the WSLc SDK handles
-are not thread-agnostic). Today `exec` blocks that worker for the duration of the run, so commands
-against different sandboxes are serialized — correct, just not concurrent. See
-[Known limitations](#known-limitations).
+The daemon owns the live SDK handles on a **single apartment-affine worker thread**, which services
+every lifecycle command. Any thread that has joined the MTA may use those handles, so an image
+pull and an `exec` each run on an MTA thread of their own and post their outcome back to the
+worker, leaving it free to serve other sandboxes for the duration of a run. A command naming a
+container with a run in flight waits for that run, because deleting the container would free a
+handle the run is using. See [Known limitations](#known-limitations).
 
 ## Components
 
@@ -141,8 +143,7 @@ the streaming path reports it through its wait result.
 
 ### exec admission, cancellation, and failure containment
 
-The daemon runs one exec at a time because all WSLc SDK operations are confined
-to one apartment-affine worker. A concurrent exec is rejected with
+The daemon admits one exec at a time. A concurrent exec is rejected with
 `backend_error` rather than queued behind an unknown-duration workload. Up to
 eight additional control connections can be serviced while an exec owns the
 stream slot; connections beyond the daemon's bounded client capacity are
@@ -301,12 +302,15 @@ fixtures **through the harness**, not by pointing `wxc-exec --config` at them di
 
 ## Known limitations
 
-- **Serialized exec (deferred).** Because the daemon's single worker thread blocks on
-  `WaitForSingleObject` for the whole `exec`, no other sandbox can provision or exec while one
-  command runs, and a per-container single-flight `Busy` guard is not yet meaningful. The intended
-  fix splits `exec` into an on-worker `ExecStart` (extract the thread-agnostic Win32 exit-event
-  handle) + an off-thread wait + an on-worker `ExecReap`, with a per-container `in_flight` slot. This
-  is tracked as follow-up work.
+- **Multiple exec streams are deferred.** The daemon admits one exec stream at a time, so a
+  client's concurrent exec is refused rather than run alongside the first, and the per-container
+  single-flight slot is not reported as `Busy`. Raising that bound is tracked as follow-up work.
+  Lifecycle calls on another sandbox are a separate matter: they are admitted through the control
+  client reserve and proceed while a run is in flight.
+
+- **Ordering is per-container, not global.** Commands naming a container with a run in flight wait
+  for that run; commands for other sandboxes proceed independently. A caller cannot infer that
+  work on one sandbox completed because work on another did.
 
 - **No typed SDK can set port mappings yet.** The Rust, Node, and .NET v1 SDKs
   all pin the published stable contract `1.0.0`, which does not declare the
