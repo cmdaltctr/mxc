@@ -269,8 +269,8 @@ policy denial occurrences plus diagnostic outcomes omitted from the policy file:
 ```
 
 Signatures are keyed by symbolic provider category, provider GUID,
-provider-scoped event ID, schema name, closed outcome reason, PID, and sorted
-sanitized properties. SIDs, capability names, GUIDs, PIDs/process identifiers, and
+provider-scoped event ID, schema name, outcome reason from a fixed list, PID, and
+sorted sanitized properties. SIDs, capability names, GUIDs, PIDs/process identifiers, and
 non-file resource values are retained. Complete file paths are replaced with
 `<REDACTED>`; standalone user/account names remain replaced with
 `<redacted-user>`.
@@ -284,8 +284,8 @@ under the same signature and increment its count. `accessType` and
 `resourceType` are included when denial extraction determined them; diagnostic
 outcomes without those classifications omit the fields.
 
-Candidates excluded from the actionable output retain a closed diagnostic
-reason and their sanitized event properties:
+Candidates excluded from the actionable output retain a diagnostic
+reason from a fixed list and their sanitized event properties:
 
 - `notActionable` includes registry writes, registry checks whose access mask
   cannot be classified as a read, and recognized Section, SymbolicLink, and
@@ -319,7 +319,7 @@ the event has no actionable extractor. NetworkDecision records are kept only by
 unscoped analysis, with PID 0 and that reason; the local file keeps their
 sanitized properties, including remote endpoints, while telemetry drops them.
 
-Per-event TDH failures use closed diagnostic reasons:
+Per-event TDH failures use these predefined diagnostic reasons:
 `eventPayloadMalformed` means the payload is malformed or conflicts with its declared schema,
 `decoderLimitReached` means a nesting/element/work safety bound stopped
 decoding, and `unsupportedPropertyEncoding` means the decoder cannot consume
@@ -350,7 +350,7 @@ When stable telemetry is enabled and authorized, MXC may validate, compact, and
 send this redacted verbose document through `Microsoft.MXC/MXC.VerboseDenials`. Each
 event contains a valid JSON array of complete signatures and document
 reconstruction metadata. Before emission, MXC derives provider GUIDs from the
-closed provider enum and drops every verbose property name and value. MXC does
+predefined provider enum and drops every verbose property name and value. MXC does
 not send the actionable denials file, workload-derived properties, or raw ETL
 through telemetry. See [MXC telemetry](development/architecture/telemetry.md).
 
