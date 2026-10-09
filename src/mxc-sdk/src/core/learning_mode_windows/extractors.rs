@@ -119,7 +119,7 @@ pub struct RawDenial {
     pub event_id: u16,
     /// Symbolic category of the originating provider, for verbose logging
     /// aggregation. Never a raw provider GUID.
-    pub provider: VerboseLoggingProvider,
+    pub provider: Option<VerboseLoggingProvider>,
     /// Bounded sensitive-value-redacted properties retained for verbose logging signatures.
     pub verbose_logging_properties: Vec<(String, String)>,
 }
@@ -146,7 +146,6 @@ pub fn extract_denial(
     if !is_learning_mode_event(parts.provider, parts.event_id) {
         return Err(VerboseLoggingOutcomeReason::UnsupportedEventSchema);
     }
-
     match parts.event_id {
         ACCESS_CHECK_EVENT_ID | PRIVACY_ACCESS_CHECK_EVENT_ID => {
             build_denial_from_access_check(parts, pid, filetime, provider)
@@ -167,6 +166,10 @@ pub fn extract_denial(
 pub(crate) fn verbose_logging_classification(
     parts: &DecodedEventParts,
 ) -> (Option<AccessType>, Option<ResourceType>) {
+    if parts.provider == super::network_extractors::NETWORK_DECISION_PROVIDER {
+        return super::network_extractors::verbose_logging_classification(parts);
+    }
+
     match parts.event_id {
         ACCESS_CHECK_EVENT_ID | PRIVACY_ACCESS_CHECK_EVENT_ID => {
             let Some(object_type) = find_prop(&parts.props, "ObjectType") else {
@@ -245,6 +248,9 @@ pub(crate) fn is_process_scoped_event(provider: GUID, event_id: u16) -> bool {
 
 pub(crate) fn effective_event_pid(parts: &DecodedEventParts, header_pid: u32) -> Option<u32> {
     if parts.provider == NETWORK_DECISION_PROVIDER {
+        // Public WFP NetEvents carry package/application identity but no
+        // reliable workload PID. PID 0 is the explicit wire sentinel for
+        // unavailable process identity.
         Some(0)
     } else if parts.event_id == CAPABILITY_DENIAL_EVENT_ID {
         effective_capability_event_pid(
@@ -275,8 +281,6 @@ pub(crate) fn verbose_logging_provider_for_guid(provider: GUID) -> Option<Verbos
         Some(VerboseLoggingProvider::KernelGeneral)
     } else if provider == PRIVACY_LEARNING_MODE_PROVIDER {
         Some(VerboseLoggingProvider::PrivacyAuditingPermissiveLearningMode)
-    } else if provider == NETWORK_DECISION_PROVIDER {
-        Some(VerboseLoggingProvider::LearningModeNetworkDecision)
     } else {
         None
     }
@@ -293,9 +297,6 @@ pub(crate) fn verbose_logging_provider_guid(provider: VerboseLoggingProvider) ->
         }
         VerboseLoggingProvider::PrivacyAuditingPermissiveLearningMode => {
             format_guid_braced_uppercase(PRIVACY_LEARNING_MODE_PROVIDER)
-        }
-        VerboseLoggingProvider::LearningModeNetworkDecision => {
-            format_guid_braced_uppercase(NETWORK_DECISION_PROVIDER)
         }
     }
 }
@@ -434,6 +435,9 @@ fn is_identity_property(name: &str) -> bool {
 
 fn looks_like_file_path_property(name: &str, value: &str, object_type: Option<&str>) -> bool {
     let normalized = NormalizedPropertyName(name);
+    if normalized.equals("applicationid") {
+        return true;
+    }
     if normalized.ends_with("path")
         || normalized.ends_with("filename")
         || normalized.ends_with("filenamestring")
@@ -778,7 +782,7 @@ pub fn build_denial_from_access_check(
         access_type,
         filetime,
         event_id: parts.event_id,
-        provider,
+        provider: Some(provider),
         verbose_logging_properties: sanitize_properties(&parts.props),
     })
 }
@@ -868,7 +872,7 @@ pub fn build_denial_from_learning_mode(
         access_type: AccessType::Unknown,
         filetime,
         event_id: parts.event_id,
-        provider,
+        provider: Some(provider),
         verbose_logging_properties: sanitize_properties(&parts.props),
     })
 }
@@ -935,7 +939,7 @@ pub fn build_denial_from_capability(
         access_type: AccessType::Unknown,
         filetime,
         event_id: parts.event_id,
-        provider,
+        provider: Some(provider),
         verbose_logging_properties: sanitize_properties(&parts.props),
     })
 }
@@ -1667,7 +1671,7 @@ mod tests {
         // pid comes from the payload ProcessId (0x1acc), not the header.
         assert_eq!(ev.pid, 0x1acc);
         assert_eq!(ev.object_name, "internetClient");
-        assert_eq!(ev.provider, VerboseLoggingProvider::KernelGeneral);
+        assert_eq!(ev.provider, Some(VerboseLoggingProvider::KernelGeneral));
     }
 
     #[test]
@@ -2245,6 +2249,18 @@ mod tests {
                 ("Zeta".to_string(), "z".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn sanitize_properties_redacts_network_application_id() {
+        let application_id = r"\Device\HarddiskVolume3\app.exe";
+        let out = sanitize_properties(&[("ApplicationId".to_string(), application_id.to_string())]);
+
+        assert_eq!(
+            out,
+            vec![("ApplicationId".to_string(), REDACTED_PATH.to_string())]
+        );
+        assert!(out.iter().all(|(_, value)| value != application_id));
     }
 
     #[test]
